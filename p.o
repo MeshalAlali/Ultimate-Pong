@@ -1,0 +1,684 @@
+; ==========================================================
+; PONG on CR16 (CPU does physics, VGA HW draws via MMIO)
+; ==========================================================
+
+; ------------- MMIO word addresses -------------
+MMIO_TICK        = 0x3C0
+IN_PLY_L_Y       = 0x3C1
+IN_PLY_L_DY      = 0x3C2
+IN_PLY_R_Y       = 0x3C3
+IN_PLY_R_DY      = 0x3C4
+IN_BTN_L         = 0x3C5
+IN_BTN_R         = 0x3C6
+
+OUT_SCORE_L      = 0x3D0
+OUT_SCORE_R      = 0x3D1
+OUT_METER_L      = 0x3D2
+OUT_METER_R      = 0x3D3
+OUT_CHARGED_L    = 0x3D4
+OUT_CHARGED_R    = 0x3D5
+
+OUT_B0_X         = 0x3E0
+OUT_B0_Y         = 0x3E1
+OUT_B0_SPINMAG   = 0x3E2
+OUT_B0_FLAGS     = 0x3E3
+OUT_B1_X         = 0x3E4
+OUT_B1_Y         = 0x3E5
+OUT_B1_SPINMAG   = 0x3E6
+OUT_B1_FLAGS     = 0x3E7
+OUT_B2_X         = 0x3E8
+OUT_B2_Y         = 0x3E9
+OUT_B2_SPINMAG   = 0x3EA
+OUT_B2_FLAGS     = 0x3EB
+
+; ------------- Game constants -------------
+W               = 800
+H               = 600
+TOP_Y           = 12
+BOT_Y           = (H - 12)
+
+PADDLE_H        = 90
+PADDLE_W        = 14
+BALL_R          = 8
+
+PADDLE_L_X      = 40
+PADDLE_R_X      = (W - 40)
+
+MAX_BALLS       = 3
+HITS_PER_METER  = 5
+
+; fixed point Q8.8 helpers
+FP_SHIFT        = 8
+FP_ONE          = 0x0100
+
+; speeds (Q8.8)
+BALL_VX0        = (320 << FP_SHIFT)      ; base like python BALL_SPEED :contentReference[oaicite:27]{index=27}
+BALL_VY0        = (  0 << FP_SHIFT)
+
+; curve/spin tuning (integer-friendly)
+MAGNUS_K        = 6        ; vy += spin * (1<<MAGNUS_K) * sign(vx)
+SPIN_DECAY_SH   = 3        ; spin -= spin >> 3
+SPIN_BOUNCE_SH  = 4        ; spin -= spin >> 4 on wall bounce
+POWER_MULT_SH   = 1        ; powered shot ~1.5x ≈ (v + v>>1)
+
+; ----------------------------------------------------------
+; RAM variables (place them wherever your data region lives)
+; ----------------------------------------------------------
+scoreL:         .word 0
+scoreR:         .word 0
+rally:          .word 0
+
+meterL:         .word 0        ; 0..4
+meterR:         .word 0
+chargedL:       .word 0        ; 0/1 (earned)
+chargedR:       .word 0
+curveReadyL:    .word 0        ; 0/1 (armed by button)
+curveReadyR:    .word 0
+
+pL_y_pix:       .word 0
+pL_dy_pix:      .word 0
+pR_y_pix:       .word 0
+pR_dy_pix:      .word 0
+
+; ball arrays (index 0..2)
+b0_alive:       .word 0
+b0_x_fp:        .word 0
+b0_y_fp:        .word 0
+b0_vx_fp:       .word 0
+b0_vy_fp:       .word 0
+b0_spin:        .word 0
+b0_pulse:       .word 0
+
+b1_alive:       .word 0
+b1_x_fp:        .word 0
+b1_y_fp:        .word 0
+b1_vx_fp:       .word 0
+b1_vy_fp:       .word 0
+b1_spin:        .word 0
+b1_pulse:       .word 0
+
+b2_alive:       .word 0
+b2_x_fp:        .word 0
+b2_y_fp:        .word 0
+b2_vx_fp:       .word 0
+b2_vy_fp:       .word 0
+b2_spin:        .word 0
+b2_pulse:       .word 0
+
+
+; ==========================================================
+; ENTRY
+; ==========================================================
+START:
+    CALL INIT_GAME
+
+MAIN_LOOP:
+    CALL WAIT_TICK
+    CALL READ_INPUTS
+    CALL HANDLE_CURVE_BUTTONS
+
+    CALL UPDATE_BALL0
+    CALL UPDATE_BALL1
+    CALL UPDATE_BALL2
+
+    CALL MULTIBALL_SPAWN_CHECK
+    CALL WRITE_VGA_REGS
+    BRA  MAIN_LOOP
+
+
+; ==========================================================
+; WAIT_TICK: poll MMIO_TICK until nonzero, then clear it
+; ==========================================================
+WAIT_TICK:
+WT_LOOP:
+    MOV  r0, #MMIO_TICK
+    LD   r1, [r0]
+    CMP  r1, #0
+    BEQ  WT_LOOP
+    ; clear tick
+    MOV  r1, #0
+    ST   r1, [r0]
+    RET
+
+
+; ==========================================================
+; READ_INPUTS: copy paddle Y and DY from FPGA MMIO
+; ==========================================================
+READ_INPUTS:
+    MOV  r0, #IN_PLY_L_Y
+    LD   r1, [r0]
+    ST   r1, [pL_y_pix]
+    MOV  r0, #IN_PLY_L_DY
+    LD   r1, [r0]
+    ST   r1, [pL_dy_pix]
+
+    MOV  r0, #IN_PLY_R_Y
+    LD   r1, [r0]
+    ST   r1, [pR_y_pix]
+    MOV  r0, #IN_PLY_R_DY
+    LD   r1, [r0]
+    ST   r1, [pR_dy_pix]
+    RET
+
+
+; ==========================================================
+; HANDLE_CURVE_BUTTONS:
+; If BTN pressed and charged==1 -> arm curveReady, consume charged
+; matches python: press key when charge available :contentReference[oaicite:28]{index=28}
+; ==========================================================
+HANDLE_CURVE_BUTTONS:
+    ; left
+    MOV  r0, #IN_BTN_L
+    LD   r1, [r0]
+    CMP  r1, #0
+    BEQ  HCB_R
+
+    LD   r2, [chargedL]
+    CMP  r2, #0
+    BEQ  HCB_R
+    MOV  r2, #1
+    ST   r2, [curveReadyL]
+    MOV  r2, #0
+    ST   r2, [chargedL]
+
+HCB_R:
+    MOV  r0, #IN_BTN_R
+    LD   r1, [r0]
+    CMP  r1, #0
+    BEQ  HCB_DONE
+
+    LD   r2, [chargedR]
+    CMP  r2, #0
+    BEQ  HCB_DONE
+    MOV  r2, #1
+    ST   r2, [curveReadyR]
+    MOV  r2, #0
+    ST   r2, [chargedR]
+
+HCB_DONE:
+    RET
+
+
+; ==========================================================
+; INIT_GAME: scores 0, rally 0, spawn one ball center
+; respawn behavior like python :contentReference[oaicite:29]{index=29}
+; ==========================================================
+INIT_GAME:
+    MOV  r0, #0
+    ST   r0, [scoreL]
+    ST   r0, [scoreR]
+    ST   r0, [rally]
+    ST   r0, [meterL]
+    ST   r0, [meterR]
+    ST   r0, [chargedL]
+    ST   r0, [chargedR]
+    ST   r0, [curveReadyL]
+    ST   r0, [curveReadyR]
+
+    ; kill all balls first
+    ST   r0, [b0_alive]
+    ST   r0, [b1_alive]
+    ST   r0, [b2_alive]
+
+    ; spawn ball0
+    MOV  r0, #1
+    ST   r0, [b0_alive]
+    MOV  r0, #( (W/2) << FP_SHIFT )
+    ST   r0, [b0_x_fp]
+    MOV  r0, #( (H/2) << FP_SHIFT )
+    ST   r0, [b0_y_fp]
+    MOV  r0, #BALL_VX0
+    ST   r0, [b0_vx_fp]
+    MOV  r0, #BALL_VY0
+    ST   r0, [b0_vy_fp]
+    MOV  r0, #0
+    ST   r0, [b0_spin]
+    ST   r0, [b0_pulse]
+    RET
+
+
+; ==========================================================
+; UPDATE_BALLi: repeated 3 times (keep it dumb/simple)
+; Each does:
+;  - if !alive return
+;  - apply magnus: vy += spin * K * sign(vx) and decay spin :contentReference[oaicite:30]{index=30}
+;  - move x/y
+;  - wall bounce top/bottom :contentReference[oaicite:31]{index=31}
+;  - paddle hits (left/right) and meter/ability logic :contentReference[oaicite:32]{index=32}
+;  - goal check & score :contentReference[oaicite:33]{index=33}
+; ==========================================================
+
+UPDATE_BALL0:
+    LD   r0, [b0_alive]
+    CMP  r0, #0
+    BEQ  UB0_RET
+
+    ; ----- magnus / curve -----
+    LD   r1, [b0_spin]
+    ; decay: spin -= spin>>SPIN_DECAY_SH
+    MOV  r2, r1
+    SHR  r2, #SPIN_DECAY_SH
+    SUB  r1, r2
+    ST   r1, [b0_spin]
+
+    ; vy += (spin << MAGNUS_K) * sign(vx)
+    LD   r3, [b0_vx_fp]
+    CMP  r3, #0
+    BGE  UB0_MAG_POS
+UB0_MAG_NEG:
+    ; sign(vx) = -1 => subtract
+    MOV  r4, r1
+    SHL  r4, #MAGNUS_K
+    LD   r5, [b0_vy_fp]
+    SUB  r5, r4
+    ST   r5, [b0_vy_fp]
+    BRA  UB0_MOVE
+UB0_MAG_POS:
+    MOV  r4, r1
+    SHL  r4, #MAGNUS_K
+    LD   r5, [b0_vy_fp]
+    ADD  r5, r4
+    ST   r5, [b0_vy_fp]
+
+UB0_MOVE:
+    ; x += vx, y += vy
+    LD   r0, [b0_x_fp]
+    LD   r1, [b0_vx_fp]
+    ADD  r0, r1
+    ST   r0, [b0_x_fp]
+
+    LD   r0, [b0_y_fp]
+    LD   r1, [b0_vy_fp]
+    ADD  r0, r1
+    ST   r0, [b0_y_fp]
+
+    CALL BALL0_WALL_BOUNCE
+    CALL BALL0_PADDLES
+    CALL BALL0_GOAL
+UB0_RET:
+    RET
+
+; (Do the same for UPDATE_BALL1 / UPDATE_BALL2 using b1_* / b2_*)
+
+
+; ==========================================================
+; WALL_BOUNCE: clamp y and flip vy
+; top = TOP_Y + BALL_R, bot = BOT_Y - BALL_R :contentReference[oaicite:34]{index=34}
+; ==========================================================
+BALL0_WALL_BOUNCE:
+    LD   r0, [b0_y_fp]
+    ; y_pix = y_fp >> 8
+    MOV  r1, r0
+    SHR  r1, #FP_SHIFT
+
+    ; if y_pix < TOP_Y+BALL_R
+    CMP  r1, #(TOP_Y + BALL_R)
+    BGE  B0_WB_BOT
+
+    ; clamp y
+    MOV  r1, #((TOP_Y + BALL_R) << FP_SHIFT)
+    ST   r1, [b0_y_fp]
+    ; vy = -vy
+    LD   r2, [b0_vy_fp]
+    NEG  r2
+    ST   r2, [b0_vy_fp]
+    ; damp spin a bit on bounce (spin -= spin>>SPIN_BOUNCE_SH)
+    LD   r3, [b0_spin]
+    MOV  r4, r3
+    SHR  r4, #SPIN_BOUNCE_SH
+    SUB  r3, r4
+    ST   r3, [b0_spin]
+    RET
+
+B0_WB_BOT:
+    CMP  r1, #(BOT_Y - BALL_R)
+    BLE  B0_WB_RET
+    MOV  r1, #((BOT_Y - BALL_R) << FP_SHIFT)
+    ST   r1, [b0_y_fp]
+    LD   r2, [b0_vy_fp]
+    NEG  r2
+    ST   r2, [b0_vy_fp]
+    LD   r3, [b0_spin]
+    MOV  r4, r3
+    SHR  r4, #SPIN_BOUNCE_SH
+    SUB  r3, r4
+    ST   r3, [b0_spin]
+B0_WB_RET:
+    RET
+
+
+; ==========================================================
+; PADDLES: check left then right
+; Uses “moving toward paddle only” rule :contentReference[oaicite:35]{index=35}
+; On hit: nudge, flip vx, build meter, maybe curve shot :contentReference[oaicite:36]{index=36}
+; ==========================================================
+BALL0_PADDLES:
+    CALL BALL0_HIT_LEFT
+    CALL BALL0_HIT_RIGHT
+    RET
+
+BALL0_HIT_LEFT:
+    ; if vx >= 0 return
+    LD   r0, [b0_vx_fp]
+    CMP  r0, #0
+    BGE  B0HL_RET
+
+    ; get bx,by pixels
+    LD   r1, [b0_x_fp]
+    LD   r2, [b0_y_fp]
+    SHR  r1, #FP_SHIFT
+    SHR  r2, #FP_SHIFT
+
+    ; AABB check expanded by BALL_R like python :contentReference[oaicite:37]{index=37}
+    ; x in [PADDLE_L_X - PADDLE_W/2 - BALL_R .. PADDLE_L_X + PADDLE_W/2 + BALL_R]
+    CMP  r1, #(PADDLE_L_X - (PADDLE_W/2) - BALL_R)
+    BLT  B0HL_RET
+    CMP  r1, #(PADDLE_L_X + (PADDLE_W/2) + BALL_R)
+    BGT  B0HL_RET
+
+    ; y in [pL_y - PADDLE_H/2 - BALL_R .. pL_y + PADDLE_H/2 + BALL_R]
+    LD   r3, [pL_y_pix]
+    MOV  r4, r3
+    SUB  r4, #((PADDLE_H/2) + BALL_R)
+    CMP  r2, r4
+    BLT  B0HL_RET
+    MOV  r4, r3
+    ADD  r4, #((PADDLE_H/2) + BALL_R)
+    CMP  r2, r4
+    BGT  B0HL_RET
+
+    ; ----- HIT! -----
+
+    ; nudge out (x = paddle + halfW + r + 1) :contentReference[oaicite:38]{index=38}
+    MOV  r5, #((PADDLE_L_X + (PADDLE_W/2) + BALL_R + 1) << FP_SHIFT)
+    ST   r5, [b0_x_fp]
+
+    ; flip vx and small accel (approx 1.04 using add>>5)
+    LD   r6, [b0_vx_fp]
+    NEG  r6
+    MOV  r7, r6
+    SHR  r7, #5
+    ADD  r6, r7
+    ST   r6, [b0_vx_fp]
+
+    ; meter build / charge every 5 hits :contentReference[oaicite:39]{index=39}
+    CALL METER_HIT_LEFT
+
+    ; powered curve if curveReadyL else normal curve-from-dy :contentReference[oaicite:40]{index=40}
+    LD   r0, [curveReadyL]
+    CMP  r0, #0
+    BEQ  B0HL_NORMAL_CURVE
+
+B0HL_POWER_CURVE:
+    MOV  r0, #0
+    ST   r0, [curveReadyL]
+    ; spin = clamp-ish from dy (skip clamp, just scale)
+    LD   r1, [pL_dy_pix]
+    ; spin units = dy << 2
+    SHL  r1, #2
+    ST   r1, [b0_spin]
+    ; pulse flag for visuals
+    MOV  r2, #1
+    ST   r2, [b0_pulse]
+    ; vy += dy << 6 (big kick like python vy += pn*260) :contentReference[oaicite:41]{index=41}
+    LD   r3, [b0_vy_fp]
+    LD   r4, [pL_dy_pix]
+    SHL  r4, #6
+    ADD  r3, r4
+    ST   r3, [b0_vy_fp]
+    ; speed mult ~1.5: v += v>>1
+    LD   r5, [b0_vx_fp]
+    MOV  r6, r5
+    SHR  r6, #POWER_MULT_SH
+    ADD  r5, r6
+    ST   r5, [b0_vx_fp]
+    LD   r5, [b0_vy_fp]
+    MOV  r6, r5
+    SHR  r6, #POWER_MULT_SH
+    ADD  r5, r6
+    ST   r5, [b0_vy_fp]
+    ; rally++
+    CALL INC_RALLY
+    RET
+
+B0HL_NORMAL_CURVE:
+    ; normal curve: smaller spin from dy, smaller vy kick :contentReference[oaicite:42]{index=42}
+    LD   r1, [pL_dy_pix]
+    SHL  r1, #1
+    ST   r1, [b0_spin]
+    MOV  r2, #0
+    ST   r2, [b0_pulse]
+    LD   r3, [b0_vy_fp]
+    LD   r4, [pL_dy_pix]
+    SHL  r4, #4
+    ADD  r3, r4
+    ST   r3, [b0_vy_fp]
+    CALL INC_RALLY
+B0HL_RET:
+    RET
+
+; Right hit is symmetric but uses pR_y_pix/pR_dy_pix and curveReadyR, and nudges left, etc.
+
+
+; ==========================================================
+; GOAL / SCORE: if x < -50 or x > W+50 score, reset rally, clear curveReady :contentReference[oaicite:43]{index=43}
+; ==========================================================
+BALL0_GOAL:
+    LD   r0, [b0_x_fp]
+    MOV  r1, r0
+    SHR  r1, #FP_SHIFT
+
+    CMP  r1, #-50
+    BGE  B0G_RIGHT
+
+    ; right scores
+    LD   r2, [scoreR]
+    ADD  r2, #1
+    ST   r2, [scoreR]
+    CALL RESET_AFTER_SCORE
+    CALL RESPAWN_ONE_BALL
+    RET
+
+B0G_RIGHT:
+    CMP  r1, #(W + 50)
+    BLE  B0G_RET
+
+    ; left scores
+    LD   r2, [scoreL]
+    ADD  r2, #1
+    ST   r2, [scoreL]
+    CALL RESET_AFTER_SCORE
+    CALL RESPAWN_ONE_BALL
+B0G_RET:
+    RET
+
+
+RESET_AFTER_SCORE:
+    MOV  r0, #0
+    ST   r0, [rally]
+    ST   r0, [curveReadyL]
+    ST   r0, [curveReadyR]
+    ; you can also clear meters/charges if you want exact python behavior
+    RET
+
+
+RESPAWN_ONE_BALL:
+    ; kill all balls, then spawn b0 like init
+    MOV  r0, #0
+    ST   r0, [b0_alive]
+    ST   r0, [b1_alive]
+    ST   r0, [b2_alive]
+    MOV  r0, #1
+    ST   r0, [b0_alive]
+    MOV  r0, #((W/2) << FP_SHIFT)
+    ST   r0, [b0_x_fp]
+    MOV  r0, #((H/2) << FP_SHIFT)
+    ST   r0, [b0_y_fp]
+    ; serve direction alternate by (scoreL+scoreR) parity like python :contentReference[oaicite:44]{index=44}
+    LD   r1, [scoreL]
+    LD   r2, [scoreR]
+    ADD  r1, r2
+    AND  r1, #1
+    CMP  r1, #0
+    BEQ  SERVE_LEFT
+SERVE_RIGHT:
+    MOV  r0, #BALL_VX0
+    ST   r0, [b0_vx_fp]
+    BRA  SERVE_DONE
+SERVE_LEFT:
+    MOV  r0, #BALL_VX0
+    NEG  r0
+    ST   r0, [b0_vx_fp]
+SERVE_DONE:
+    MOV  r0, #0
+    ST   r0, [b0_vy_fp]
+    ST   r0, [b0_spin]
+    ST   r0, [b0_pulse]
+    RET
+
+
+; ==========================================================
+; Meter logic: every paddle hit increments meter until 5 then charged=1 :contentReference[oaicite:45]{index=45}
+; ==========================================================
+METER_HIT_LEFT:
+    LD   r0, [chargedL]
+    CMP  r0, #0
+    BNE  MHL_RET     ; if already charged, don’t build
+
+    LD   r1, [meterL]
+    ADD  r1, #1
+    CMP  r1, #HITS_PER_METER
+    BLT  MHL_STORE
+    ; reached 5
+    MOV  r1, #0
+    ST   r1, [meterL]
+    MOV  r2, #1
+    ST   r2, [chargedL]
+    RET
+MHL_STORE:
+    ST   r1, [meterL]
+MHL_RET:
+    RET
+
+INC_RALLY:
+    LD   r0, [rally]
+    ADD  r0, #1
+    ST   r0, [rally]
+    RET
+
+
+; ==========================================================
+; Multiball: if rally==6 spawn b1, if rally==12 spawn b2 :contentReference[oaicite:46]{index=46}
+; ==========================================================
+MULTIBALL_SPAWN_CHECK:
+    LD   r0, [rally]
+    CMP  r0, #6
+    BEQ  SPAWN_B1
+    CMP  r0, #12
+    BEQ  SPAWN_B2
+    RET
+
+SPAWN_B1:
+    LD   r1, [b1_alive]
+    CMP  r1, #0
+    BNE  MBS_RET
+    MOV  r1, #1
+    ST   r1, [b1_alive]
+    ; start at center with vx opposite or same—your choice
+    MOV  r1, #((W/2) << FP_SHIFT)
+    ST   r1, [b1_x_fp]
+    MOV  r1, #((H/2) << FP_SHIFT)
+    ST   r1, [b1_y_fp]
+    ; vx = +/- 0.95*BALL (approx shift)
+    MOV  r1, #BALL_VX0
+    SHR  r1, #4
+    SUB  r1, #BALL_VX0      ; (rough negative) adjust if you want
+    ST   r1, [b1_vx_fp]
+    MOV  r1, #0
+    ST   r1, [b1_vy_fp]
+    ST   r1, [b1_spin]
+    ST   r1, [b1_pulse]
+MBS_RET:
+    RET
+
+SPAWN_B2:
+    LD   r1, [b2_alive]
+    CMP  r1, #0
+    BNE  MBS_RET2
+    MOV  r1, #1
+    ST   r1, [b2_alive]
+    MOV  r1, #((W/2) << FP_SHIFT)
+    ST   r1, [b2_x_fp]
+    MOV  r1, #((H/2) << FP_SHIFT)
+    ST   r1, [b2_y_fp]
+    MOV  r1, #BALL_VX0
+    ST   r1, [b2_vx_fp]
+    MOV  r1, #0
+    ST   r1, [b2_vy_fp]
+    ST   r1, [b2_spin]
+    ST   r1, [b2_pulse]
+MBS_RET2:
+    RET
+
+
+; ==========================================================
+; WRITE_VGA_REGS: copy state to MMIO so bitgen draws it
+; ==========================================================
+WRITE_VGA_REGS:
+    ; scores
+    MOV  r0, #OUT_SCORE_L
+    LD   r1, [scoreL]
+    ST   r1, [r0]
+    MOV  r0, #OUT_SCORE_R
+    LD   r1, [scoreR]
+    ST   r1, [r0]
+
+    ; meters and charged flags
+    MOV  r0, #OUT_METER_L
+    LD   r1, [meterL]
+    ST   r1, [r0]
+    MOV  r0, #OUT_METER_R
+    LD   r1, [meterR]
+    ST   r1, [r0]
+    MOV  r0, #OUT_CHARGED_L
+    LD   r1, [chargedL]
+    ST   r1, [r0]
+    MOV  r0, #OUT_CHARGED_R
+    LD   r1, [chargedR]
+    ST   r1, [r0]
+
+    ; balls -> pixel coords
+    CALL WRITE_BALL0_OUT
+    ; CALL WRITE_BALL1_OUT
+    ; CALL WRITE_BALL2_OUT
+    RET
+
+WRITE_BALL0_OUT:
+    ; x_pix
+    LD   r1, [b0_x_fp]
+    SHR  r1, #FP_SHIFT
+    MOV  r0, #OUT_B0_X
+    ST   r1, [r0]
+    ; y_pix
+    LD   r1, [b0_y_fp]
+    SHR  r1, #FP_SHIFT
+    MOV  r0, #OUT_B0_Y
+    ST   r1, [r0]
+    ; spin magnitude (abs(spin)>>something)
+    LD   r1, [b0_spin]
+    ; abs
+    CMP  r1, #0
+    BGE  WB0_ABS_OK
+    NEG  r1
+WB0_ABS_OK:
+    SHR  r1, #4
+    MOV  r0, #OUT_B0_SPINMAG
+    ST   r1, [r0]
+    ; flags: bit0 alive, bit1 pulse
+    LD   r2, [b0_alive]
+    LD   r3, [b0_pulse]
+    SHL  r3, #1
+    OR   r2, r3
+    MOV  r0, #OUT_B0_FLAGS
+    ST   r2, [r0]
+    RET

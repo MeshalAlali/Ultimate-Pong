@@ -26,10 +26,10 @@ def draw_text(cv, x, y, text, ps, color):
     for ch in text:
         if ch == "-":
             cv.create_rectangle(
-                (cx + ps) * 2,
-                (y + 2 * ps) * 2,
-                (cx + 4 * ps) * 2,
-                (y + 3 * ps) * 2,
+                (cx + ps) * 0.8,
+                (y + 2 * ps) * 0.8,
+                (cx + 4 * ps) * 0.8,
+                (y + 3 * ps) * 0.8,
                 fill=color, outline=""
             )
             cx += step
@@ -44,10 +44,10 @@ def draw_text(cv, x, y, text, ps, color):
             for c, pix in enumerate(row):
                 if pix != " ":
                     cv.create_rectangle(
-                        (cx + c * ps) * 2,
-                        (y + r * ps) * 2,
-                        (cx + (c + 1) * ps) * 2,
-                        (y + (r + 1) * ps) * 2,
+                        (cx + c * ps) * 0.8,
+                        (y + r * ps) * 0.8,
+                        (cx + (c + 1) * ps) * 0.8,
+                        (y + (r + 1) * ps) * 0.8,
                         fill=color, outline=""
                     )
         cx += step
@@ -105,13 +105,13 @@ def paddle_hit(b, px, py, ph, pvy, is_left, st):
     if is_left:
         if not st["charge_l"]:
             st["meter_l"] += 1
-            if st["meter_l"] >= 5:
+            if st["meter_l"] >= 6:
                 st["meter_l"] = 0
                 st["charge_l"] = True
     else:
         if not st["charge_r"]:
             st["meter_r"] += 1
-            if st["meter_r"] >= 5:
+            if st["meter_r"] >= 6:
                 st["meter_r"] = 0
                 st["charge_r"] = True
 
@@ -122,11 +122,11 @@ def paddle_hit(b, px, py, ph, pvy, is_left, st):
     b["vx"] = (1.0 if b["vx"] >= 0 else -1.0) * math.sqrt(max(speed*speed - new_vy*new_vy, 1.0))
     b["vy"] = new_vy
 
-    if is_left and st["curve_ready_L"]:
-        st["curve_ready_L"] = False
+    if is_left and st["charge_l"]:
+        st["charge_l"] = False
         apply_curve_shot(b, pvy)
-    elif (not is_left) and st["curve_ready_R"]:
-        st["curve_ready_R"] = False
+    elif (not is_left) and st["charge_r"]:
+        st["charge_r"] = False
         apply_curve_shot(b, pvy)
     else:
         pn = clamp(pvy / 420, -1.0, 1.0)
@@ -148,8 +148,11 @@ def main():
     root = tk.Tk()
     root.title("Ultimate Pong")
     root.resizable(False, False)
-    cv = tk.Canvas(root, width=1600, height=1200, bg="#0b0f17", highlightthickness=0)
+    root.attributes("-topmost", True)
+    cv = tk.Canvas(root, width=640, height=480, bg="#0b0f17", highlightthickness=0)
     cv.pack()
+    cv.config(cursor="none")
+    root.grab_set()
 
     st = {
         "mouse_y": 300.0,
@@ -175,20 +178,12 @@ def main():
         "meter_r": 0,
         "charge_l": False,
         "charge_r": False,
-        "curve_ready_L": False,
-        "curve_ready_R": False,
     }
 
     def on_motion(e):
-        st["mouse_y"] = e.y / 2
-
-    def on_key(e):
-        if e.keysym.lower() == "space" and st["charge_l"] and (not st["curve_ready_L"]):
-            st["charge_l"] = False
-            st["curve_ready_L"] = True
+        st["mouse_y"] = e.y / 0.8
 
     cv.bind("<Motion>", on_motion)
-    root.bind("<KeyPress>", on_key)
 
     def ai_update(dt):
         bs = st["balls"]
@@ -204,10 +199,6 @@ def main():
         st["right_vy"] = move_dir * 380.0
         st["right_y"] += st["right_vy"] * dt
         st["right_y"] = clamp(st["right_y"], st["right_h"]/2 + 10, 600 - st["right_h"]/2 - 10)
-
-        if st["charge_r"] and (not st["curve_ready_R"]) and target["vx"] > 0 and target["x"] > 440 and random.random() < 0.55:
-            st["charge_r"] = False
-            st["curve_ready_R"] = True
 
     def step(dt):
         old = st["left_y"]
@@ -247,13 +238,11 @@ def main():
                 b["alive"] = False
                 st["score_r"] += 1
                 st["rally"] = 0
-                st["curve_ready_L"] = False
                 break
             if b["x"] > 850:
                 b["alive"] = False
                 st["score_l"] += 1
                 st["rally"] = 0
-                st["curve_ready_R"] = False
                 break
 
         st["balls"] = [b for b in st["balls"] if b["alive"]]
@@ -293,20 +282,20 @@ def main():
         cv.delete("all")
 
         for y in range(0, 600, 22):
-            cv.create_rectangle((398) * 2, (y + 4) * 2, (402) * 2, (y + 14) * 2, fill="#2b3445", outline="")
+            cv.create_rectangle((398) * 0.8, (y + 4) * 0.8, (402) * 0.8, (y + 14) * 0.8, fill="#2b3445", outline="")
 
         ls = str(st["score_l"])
         draw_text(cv, 336 - len(ls) * 24, 64, ls, 8, "#e6edf3")
         draw_text(cv, 464, 64, str(st["score_r"]), 8, "#e6edf3")
 
         cv.create_rectangle(
-            (st["left_x"] - 7) * 2, (st["left_y"] - st["left_h"]/2) * 2,
-            (st["left_x"] + 7) * 2, (st["left_y"] + st["left_h"]/2) * 2,
+            (st["left_x"] - 7) * 0.8, (st["left_y"] - st["left_h"]/2) * 0.8,
+            (st["left_x"] + 7) * 0.8, (st["left_y"] + st["left_h"]/2) * 0.8,
             fill="#e6edf3", outline=""
         )
         cv.create_rectangle(
-            (st["right_x"] - 7) * 2, (st["right_y"] - st["right_h"]/2) * 2,
-            (st["right_x"] + 7) * 2, (st["right_y"] + st["right_h"]/2) * 2,
+            (st["right_x"] - 7) * 0.8, (st["right_y"] - st["right_h"]/2) * 0.8,
+            (st["right_x"] + 7) * 0.8, (st["right_y"] + st["right_h"]/2) * 0.8,
             fill="#e6edf3", outline=""
         )
 
@@ -328,21 +317,21 @@ def main():
             else:
                 col = "#ffb000"
 
-            cv.create_rectangle((b["x"] - ww) * 2, (b["y"] - hh) * 2,
-                                (b["x"] + ww) * 2, (b["y"] + hh) * 2,
+            cv.create_rectangle((b["x"] - ww) * 0.8, (b["y"] - hh) * 0.8,
+                                (b["x"] + ww) * 0.8, (b["y"] + hh) * 0.8,
                                 fill=col, outline="")
 
         l_bar = "-----" if st["charge_l"] else ("-" * st["meter_l"]) + (" " * (5 - st["meter_l"]))
         r_bar = "-----" if st["charge_r"] else (" " * (5 - st["meter_r"])) + ("-" * st["meter_r"])
 
-        draw_text(cv, 28, 568, l_bar, 4, "#66ff99" if (st["charge_l"] or st["curve_ready_L"]) else "#e6edf3")
+        draw_text(cv, 28, 568, l_bar, 4, "#66ff99" if (st["charge_l"] or st["meter_l"] == 5) else "#e6edf3")
         draw_text(
             cv,
             772 - len(r_bar) * 24,
             568,
             r_bar,
             4,
-            "#66ff99" if (st["charge_r"] or st["curve_ready_R"]) else "#e6edf3"
+            "#66ff99" if (st["charge_r"] or st["meter_r"] == 5) else "#e6edf3"
         )
 
     def loop():
